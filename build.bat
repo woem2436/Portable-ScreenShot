@@ -1,6 +1,7 @@
 @echo off
 setlocal
-cd /d %~dp0
+chcp 65001 >nul
+cd /d "%~dp0"
 
 echo [1/3] 安装依赖...
 python -m pip install --quiet mss pystray pillow pyinstaller

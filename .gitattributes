@@ -1,0 +1,3 @@
+# cmd.exe 按 LF 拆行会把 ^ 续行后的参数当成命令执行，批处理必须是 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
