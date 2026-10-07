@@ -21,6 +21,7 @@ kernel32 = ctypes.windll.kernel32
 
 VK_SNAPSHOT = 0x2C
 VK_ESCAPE = 0x1B
+VK_BACK = 0x08
 GUI_SCALE = 2.0
 
 # 绑定是“按下顺序”而非“同时按住”，所以最多记 SEQ_MAX 个键，
@@ -68,12 +69,19 @@ def hotkey_label(seq):
     return " → ".join(key_name(vk) for vk in seq)
 
 
+def normalize_vk(code):
+    code = int(code)
+    # 按键事件偶尔把字母带成小写 ASCII（0x61-0x7A），而虚拟键码只有 0x41-0x5A 这一段，
+    # 照原样存下来就永远匹配不上真实按键。
+    return code - 0x20 if 0x61 <= code <= 0x7A else code
+
+
 def normalize_seq(value):
     if value is None:
         return []
     out = []
-    for vk in value:
-        vk = int(vk)
+    for code in value:
+        vk = normalize_vk(code)
         if vk not in out:
             out.append(vk)
     return out[:SEQ_MAX]
@@ -567,17 +575,35 @@ def build_settings_window(cfg, manager):
     ttk.Label(body, text="截图键").grid(row=r, column=0, sticky="w")
     row_key = ttk.Frame(body)
     row_key.grid(row=r, column=1, sticky="w", pady=px(2))
-    ttk.Entry(row_key, textvariable=hotkey_var, width=14, state="readonly").pack(side="left")
+    hotkey_entry = ttk.Entry(row_key, textvariable=hotkey_var, width=14, state="readonly")
+    hotkey_entry.pack(side="left")
+    # 这个框只显示绑定结果；它一旦拿到焦点，用户随手按的字母会被 Tk 当成无效输入而敲系统铃，
+    # 听起来就像“按了键但程序没反应”。
+    hotkey_entry.configure(takefocus=False)
+    hotkey_entry.bind("<KeyPress>", lambda _e: "break")
     ttk.Button(row_key, text="绑定…", width=8, command=lambda: open_binding_dialog()).pack(
         side="left", padx=(px(6), 0))
     r += 1
+
+    def apply_binding(seq):
+        """绑定立刻生效并落盘，不必再点“保存设置”，否则很容易按 Esc 之后就去按键、
+        结果什么也没绑上。其余表单项仍只在“保存设置”时写入。"""
+        seq = normalize_seq(seq)
+        pending["seq"] = seq
+        cfg["hotkey_seq"] = list(seq)
+        hotkey_var.set(hotkey_label(seq))
+        if manager:
+            manager.configure(seq)
+        ok, info = save_config(cfg)
+        status_var.set(f"截图键已{'设为 ' + hotkey_label(seq) if seq else '取消'}"
+                       if ok else f"绑定已生效，但配置写入失败：{info}")
+        return ok
 
     def open_binding_dialog():
         dlg = tk.Toplevel(root)
         dlg.title("绑定截图键")
         dlg.resizable(False, False)
         dlg.attributes("-topmost", True)
-        dlg.grab_set()
         pressed = []
         live_var = tk.StringVar(master=dlg, value="…")
         pad = px(18)
@@ -585,21 +611,32 @@ def build_settings_window(cfg, manager):
             pady=(pad, px(6)), padx=pad)
         ttk.Label(dlg, textvariable=live_var, font=("Segoe UI", 16, "bold"),
                   foreground="#1f8a4c").pack(pady=(0, px(10)), padx=pad)
-        ttk.Label(dlg, text="按 Esc 确认；没按任何键时 Esc = 取消绑定",
+        ttk.Label(dlg, text="按 Esc 确认；没按任何键时 Esc = 取消绑定；Backspace 回退一个键",
                   foreground="#666").pack(pady=(0, pad + px(8)), padx=pad)
 
-        def close(commit):
-            if commit:
-                pending["seq"] = normalize_seq(pressed)
-                hotkey_var.set(hotkey_label(pending["seq"]))
+        def finish():
+            # Esc：有键就绑它，一个键没按就是“取消绑定，不留截图键”
+            if manager:
+                manager.set_paused(False)
+            apply_binding(pressed)
+            dlg.destroy()
+
+        def cancel():
             if manager:
                 manager.set_paused(False)
             dlg.destroy()
 
         def on_key(event):
-            vk = int(event.keycode)
+            vk = normalize_vk(event.keycode)
+            if not vk:
+                return "break"  # 合成事件可能只带字符不带键码，绑了也匹配不上真实按键
             if vk == VK_ESCAPE:
-                close(bool(pressed))  # 没按键时 Esc = 取消绑定；有键则确认
+                finish()
+                return "break"
+            if vk == VK_BACK:  # 误录时回退一个键，不必重开弹窗
+                if pressed:
+                    pressed.pop()
+                live_var.set(hotkey_label(pressed) if pressed else "…")
                 return "break"
             if len(pressed) < SEQ_MAX and vk not in pressed:
                 pressed.append(vk)
@@ -609,14 +646,18 @@ def build_settings_window(cfg, manager):
         if manager:
             manager.set_paused(True)
         dlg.bind("<KeyPress>", on_key)
-        dlg.protocol("WM_DELETE_WINDOW", lambda: close(False))  # 点 ✕ = 保持原绑定
+        dlg.protocol("WM_DELETE_WINDOW", cancel)  # 点 ✕ = 保持原绑定
         dlg.transient(root)  # 跟着主窗走，别留在桌面角落
         dlg.update_idletasks()
         cx = root.winfo_rootx() + (root.winfo_width() - dlg.winfo_reqwidth()) // 2
         cy = root.winfo_rooty() + (root.winfo_height() - dlg.winfo_reqheight()) // 2
         dlg.geometry(f"+{max(0, cx)}+{max(0, cy)}")
-        dlg.focus_set()
-        dlg.bind("<Button-1>", lambda _e: dlg.focus_set())
+        # 窗口真正映射之后再抓键盘，早于这一步的 grab_set 在 Windows 上可能静默失效，
+        # 于是按键落回主窗口、一个键也录不上。
+        dlg.wait_visibility()
+        dlg.grab_set()
+        dlg.focus_force()
+        dlg.bind("<Button-1>", lambda _e: dlg.focus_force())
 
     r = section(r, "输出")
     ttk.Label(body, text="图片格式").grid(row=r, column=0, sticky="w")
@@ -943,6 +984,7 @@ def run_selftest():
     seq_checks = [
         (normalize_seq(None) == [], "None 视为未绑定"),
         (normalize_seq([0x42, 0x42, 0x43]) == [0x42, 0x43], "重复键去重"),
+        (normalize_seq([0x71]) == [0x51], "小写 ASCII 键码归一到 VK"),
         (len(normalize_seq([0x41, 0x42, 0x43, 0x44, 0x45])) == SEQ_MAX, "超过 SEQ_MAX 截断"),
         (hotkey_label([0x41, 0x11]) == "A → Ctrl", "标签按顺序展示"),
     ]
