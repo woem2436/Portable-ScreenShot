@@ -109,12 +109,39 @@ DEFAULT_CONFIG = {
     "naming": "timestamp",
     "monitor": "primary",
     "copy_to_clipboard": False,
-    "play_sound": False,
+    "sound_mode": "system",
+    "sound_file": "",
     "png_compression": 3,
 }
 
 MONITOR_PRIMARY = "primary"
 MONITOR_ALL = "all"
+
+SOUND_MODES = {"不播放": "off", "系统音效": "system", "自定义文件": "custom"}
+SYSTEM_SOUND_FILE = "Windows Notify.wav"
+
+
+def system_sound_path():
+    return os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Media", SYSTEM_SOUND_FILE)
+
+
+def resolve_sound(cfg):
+    """返回要播放的 wav 路径，None 表示这次不出声。"""
+    mode = cfg.get("sound_mode", "off")
+    if mode == "custom":
+        path = str(cfg.get("sound_file") or "").strip()
+        return path if path.lower().endswith(".wav") and os.path.isfile(path) else None
+    if mode == "system":
+        path = system_sound_path()
+        return path if os.path.isfile(path) else None
+    return None
+
+
+def play_shutter_sound(cfg):
+    path = resolve_sound(cfg)
+    if path:
+        # 异步播放：写盘线程不该被一段音频拖住
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
 
 QUALITY_TIERS = (
     (50, 64, "压缩较强，体积最小，文字与色带边缘会有块状伪影"),
@@ -124,17 +151,29 @@ QUALITY_TIERS = (
 )
 
 
+def sound_mode_from_legacy(stored):
+    """旧版本只有一个 play_sound 布尔开关。"""
+    return "system" if stored.get("play_sound") else "off"
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
+    stored = {}
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            stored = json.load(f)
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            stored = loaded
         for key in cfg:
             if key in stored:
                 cfg[key] = stored[key]
     except (OSError, ValueError):
         pass
     cfg["hotkey_seq"] = normalize_seq(cfg.get("hotkey_seq"))
+    if "sound_mode" not in stored:  # 旧版本只有一个 play_sound 开关
+        cfg["sound_mode"] = sound_mode_from_legacy(stored)
+    if cfg.get("sound_mode") not in SOUND_MODES.values():
+        cfg["sound_mode"] = "off"
     return cfg
 
 
@@ -369,8 +408,7 @@ class Capturer:
                 os.replace(tmp, job.path)
                 if job.cfg.get("copy_to_clipboard"):
                     copy_to_clipboard(img)
-                if job.cfg.get("play_sound"):
-                    winsound.Beep(1200, 40)
+                play_shutter_sound(job.cfg)
                 self.last_error = None
             except Exception as exc:
                 self.last_error = f"{job.path}: {exc}"
@@ -766,13 +804,44 @@ def build_settings_window(cfg, manager):
 
     r = section(r, "附加选项")
     clip_var = tk.BooleanVar(value=bool(cfg["copy_to_clipboard"]))
-    sound_var = tk.BooleanVar(value=bool(cfg["play_sound"]))
-    for label, var in (
-        ("同时复制到剪贴板", clip_var),
-        ("截图成功后提示音", sound_var),
-    ):
-        ttk.Checkbutton(body, text=label, variable=var).grid(row=r, column=0, columnspan=2, sticky="w")
-        r += 1
+    ttk.Checkbutton(body, text="同时复制到剪贴板", variable=clip_var).grid(
+        row=r, column=0, columnspan=2, sticky="w")
+    r += 1
+
+    ttk.Label(body, text="截图提示音").grid(row=r, column=0, sticky="w")
+    sound_row = ttk.Frame(body)
+    sound_row.grid(row=r, column=1, sticky="w", pady=px(2))
+    sound_box = ttk.Combobox(sound_row, values=list(SOUND_MODES), state="readonly", width=9)
+    sound_box.set(next((k for k, v in SOUND_MODES.items() if v == cfg["sound_mode"]), "不播放"))
+    sound_box.pack(side="left")
+    sound_file_var = tk.StringVar(value=str(cfg.get("sound_file", "")))
+    sound_entry = ttk.Entry(sound_row, textvariable=sound_file_var, width=18)
+    sound_entry.pack(side="left", padx=(px(6), 0))
+    sound_browse = ttk.Button(sound_row, text="浏览…", width=7, command=lambda: browse_sound())
+    sound_browse.pack(side="left", padx=px(4))
+    ttk.Button(sound_row, text="试听", width=7, command=lambda: preview_sound()).pack(side="left")
+
+    def refresh_sound():
+        custom = SOUND_MODES[sound_box.get()] == "custom"
+        state = ["!disabled"] if custom else ["disabled"]
+        sound_entry.state(state)
+        sound_browse.state(state)
+
+    def browse_sound():
+        initial = os.path.dirname(sound_file_var.get()) or os.path.dirname(system_sound_path())
+        chosen = filedialog.askopenfilename(title="选择提示音", initialdir=initial,
+                                            filetypes=[("WAV 音频", "*.wav")])
+        if chosen:
+            sound_file_var.set(chosen)
+            preview_sound()
+
+    def preview_sound():
+        play_shutter_sound({"sound_mode": SOUND_MODES[sound_box.get()],
+                            "sound_file": sound_file_var.get()})
+
+    sound_box.bind("<<ComboboxSelected>>", lambda _e: refresh_sound())
+    refresh_sound()
+    r += 1
 
     r += 1
 
@@ -786,7 +855,8 @@ def build_settings_window(cfg, manager):
         new["save_dir"] = os.path.abspath(dir_var.get().strip() or os.path.join(app_dir(), "Screenshots"))
         new["monitor"] = mon_keys[mon_box.current()]
         new["copy_to_clipboard"] = bool(clip_var.get())
-        new["play_sound"] = bool(sound_var.get())
+        new["sound_mode"] = SOUND_MODES[sound_box.get()]
+        new["sound_file"] = sound_file_var.get().strip()
         cfg.clear()
         cfg.update(new)
         ok, info = save_config(cfg)
@@ -952,7 +1022,7 @@ def run_selftest():
     cfg["naming"] = "timestamp"
     cfg["format"] = "png"
     cfg["copy_to_clipboard"] = False
-    cfg["play_sound"] = False
+    cfg["sound_mode"] = "off"
     os.makedirs(cfg["save_dir"], exist_ok=True)
     for stale in os.listdir(cfg["save_dir"]):
         try:
@@ -1068,6 +1138,21 @@ def run_selftest():
     has_dib = bool(user32.IsClipboardFormatAvailable(CF_DIB))
     user32.CloseClipboard()
     results.append(("剪贴板 CF_DIB", has_dib and not clip_err, clip_err or os.path.basename(path)))
+
+    sys_sound = system_sound_path()
+    has_sys_sound = os.path.isfile(sys_sound)
+    sound_checks = [
+        (resolve_sound({"sound_mode": "off"}) is None, "关闭时不出声"),
+        (resolve_sound({"sound_mode": "system"}) == (sys_sound if has_sys_sound else None), "系统音效只指向真实文件"),
+        (resolve_sound({"sound_mode": "custom", "sound_file": sys_sound}) == (sys_sound if has_sys_sound else None),
+         "自定义 wav 按路径解析"),
+        (resolve_sound({"sound_mode": "custom", "sound_file": "C:\\nope\\missing.wav"}) is None, "文件不见了就静默不响"),
+        (resolve_sound({"sound_mode": "custom", "sound_file": __file__}) is None, "非 wav 文件拒用"),
+        (sound_mode_from_legacy({"play_sound": True}) == "system" and sound_mode_from_legacy({}) == "off",
+         "旧 play_sound 开关迁移"),
+    ]
+    bad_sound = [name for ok, name in sound_checks if not ok]
+    results.append(("提示音解析规则", not bad_sound, bad_sound or os.path.basename(sys_sound)))
 
     burst = [capturer.capture_now()[2] for _ in range(5)]
     drained = capturer.wait_idle(15)
