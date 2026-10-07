@@ -22,6 +22,7 @@ kernel32 = ctypes.windll.kernel32
 VK_SNAPSHOT = 0x2C
 VK_ESCAPE = 0x1B
 VK_BACK = 0x08
+WINDOW_TITLE = "Portable ScreenShot 设置"
 GUI_SCALE = 2.0
 
 # 绑定是“按下顺序”而非“同时按住”，所以最多记 SEQ_MAX 个键，
@@ -254,6 +255,15 @@ def copy_to_clipboard(img):
     return True
 
 
+BAD_NAME_CHARS = set('\\/:*?"<>|\r\n\t')
+
+
+def safe_file_prefix(value):
+    """文件名前缀来自 config.json，去掉路径分隔符才不会写到保存目录外面去。"""
+    cleaned = "".join(ch for ch in str(value) if ch not in BAD_NAME_CHARS).strip(". ")
+    return cleaned[:32] or "shot_"
+
+
 def next_sequence(save_dir, prefix, ext):
     highest = 0
     suffix = f".{ext}"
@@ -323,7 +333,7 @@ class Capturer:
         ext = {"jpeg": "jpg", "jpg": "jpg", "png": "png", "bmp": "bmp"}.get(fmt, "png")
         save_dir = cfg.get("save_dir") or os.path.join(app_dir(), "Screenshots")
         os.makedirs(save_dir, exist_ok=True)
-        prefix = cfg.get("prefix", "shot_")
+        prefix = safe_file_prefix(cfg.get("prefix", "shot_"))
 
         if cfg.get("naming") == "sequence":
             if self._seq is None:
@@ -347,14 +357,16 @@ class Capturer:
 
         while True:
             job = self._jobs.get()
+            tmp = f"{job.path}.part"  # 先写临时名再原子改名，中途被杀也不会留下半张图
             try:
                 img = Image.frombytes("RGB", (job.width, job.height), job.pixels)
                 if job.ext == "png":
-                    img.save(job.path, "PNG", compress_level=int(job.cfg.get("png_compression", 3)))
+                    img.save(tmp, "PNG", compress_level=int(job.cfg.get("png_compression", 3)))
                 elif job.ext == "jpg":
-                    img.save(job.path, "JPEG", quality=int(job.cfg.get("quality", 92)), subsampling=0)
+                    img.save(tmp, "JPEG", quality=int(job.cfg.get("quality", 92)), subsampling=0)
                 else:
-                    img.save(job.path, "BMP")
+                    img.save(tmp, "BMP")
+                os.replace(tmp, job.path)
                 if job.cfg.get("copy_to_clipboard"):
                     copy_to_clipboard(img)
                 if job.cfg.get("play_sound"):
@@ -362,6 +374,10 @@ class Capturer:
                 self.last_error = None
             except Exception as exc:
                 self.last_error = f"{job.path}: {exc}"
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
             finally:
                 with self._lock:
                     self._inflight.discard(job.path)
@@ -459,7 +475,10 @@ class KeySequenceHook:
     def _drain(self):
         while True:
             self._signals.get()
-            self.on_capture()
+            try:
+                self.on_capture()
+            except Exception as exc:  # 回调抛错不能让线程退出，否则之后按键再也不会截图
+                self.on_status(f"截图线程异常：{exc}", False)
 
     def _feed(self, vk):
         if not self._seq or self._paused:
@@ -480,10 +499,15 @@ class KeySequenceHook:
                 pass
 
     def _callback(self, ncode, wparam, lparam):
-        if ncode == 0 and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-            info = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            if not info.flags & LLKHF_UP:
-                self._feed(int(info.vkCode))
+        # 回调里抛异常会让 ctypes 返回 0，等于把这次按键从整台机器面前吞掉，
+        # 还会跳过 CallNextHookEx，所以这里必须兜住。
+        try:
+            if ncode == 0 and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                info = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                if not info.flags & LLKHF_UP:
+                    self._feed(int(info.vkCode))
+        except Exception:
+            pass
         return user32.CallNextHookEx(None, ncode, wparam, lparam)
 
     def _apply_pending(self):
@@ -556,7 +580,7 @@ def build_settings_window(cfg, manager):
         return int(value * GUI_SCALE)
 
     status_var = tk.StringVar(master=root, value="正在安装键盘钩子…")
-    root.title("Portable ScreenShot 设置")
+    root.title(WINDOW_TITLE)
     root.resizable(False, False)
     root.attributes("-topmost", True)
     root.after(400, lambda: root.attributes("-topmost", False))
@@ -721,7 +745,12 @@ def build_settings_window(cfg, manager):
 
     def open_dir():
         path = dir_var.get().strip() or os.path.join(app_dir(), "Screenshots")
-        os.makedirs(path, exist_ok=True)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            pass
+        if not os.path.isdir(path):  # 手改过的 config.json 可能把它指向一个文件，别直接 startfile
+            path = app_dir()
         os.startfile(path)
 
     r = section(r, "抓取范围")
@@ -811,7 +840,8 @@ def acquire_single_instance():
 
 
 def focus_existing_window():
-    hwnd = user32.FindWindowW("TkTopLevel", None)
+    # 只按类名找会唤起别人家的 Tk 窗口，必须连标题一起匹配
+    hwnd = user32.FindWindowW("TkTopLevel", WINDOW_TITLE)
     if not hwnd:
         return False
     user32.ShowWindow(hwnd, SW_RESTORE)
@@ -824,16 +854,11 @@ def focus_existing_window():
 
 def run(cfg, headless=False, tray=True):
     capturer = Capturer(cfg)
-    state = {"root": None, "status_var": None}
+    notes = queue.Queue()
+    ui = {"show": False, "quit": False}
 
     def report(text):
-        state["last"] = text
-        root = state["root"]
-        if root is not None and state["status_var"] is not None:
-            try:
-                root.after(0, lambda: state["status_var"].set(text))
-            except Exception:
-                pass
+        notes.put(text)
 
     def do_capture():
         try:
@@ -851,24 +876,23 @@ def run(cfg, headless=False, tray=True):
         return capturer, manager, do_capture
 
     root, status_var = build_settings_window(cfg, manager)
-    state["status_var"] = status_var
-    state["root"] = root
-    if state.get("last"):
-        status_var.set(state["last"])
 
     icon = None
     if tray:
         try:
             import pystray
 
-            def open_settings():
-                root.deiconify()
-                root.lift()
+            def request_show():
+                ui["show"] = True
+
+            def request_quit():
+                manager.stop()
+                ui["quit"] = True
 
             menu = pystray.Menu(
-                pystray.MenuItem("打开设置", lambda _i, _m: root.after(0, open_settings), default=True),
+                pystray.MenuItem("打开设置", lambda _i, _m: request_show(), default=True),
                 pystray.Menu.SEPARATOR,
-                pystray.MenuItem("退出", lambda _i, _m: (manager.stop(), root.after(0, root.destroy))),
+                pystray.MenuItem("退出", lambda _i, _m: request_quit()),
             )
             icon = pystray.Icon(
                 "portable_screenshot", build_icon_image(),
@@ -876,6 +900,25 @@ def run(cfg, headless=False, tray=True):
             threading.Thread(target=icon.run, daemon=True, name="tray").start()
         except Exception:
             icon = None
+
+    def pump():
+        # Tcl 不是线程安全的：钩子线程和托盘线程都只往队列/字典里丢消息，
+        # 一切 Tk 调用都回到这里由主线程执行。
+        while True:
+            try:
+                status_var.set(notes.get_nowait())
+            except queue.Empty:
+                break
+        if ui["show"]:
+            ui["show"] = False
+            root.deiconify()
+            root.lift()
+        if ui["quit"]:
+            root.destroy()
+            return
+        root.after(120, pump)
+
+    root.after(60, pump)
 
     def watch_thread():
         if not manager.is_alive():
@@ -997,6 +1040,21 @@ def run_selftest():
         ok = os.path.isfile(path) and os.path.getsize(path) > 1000
         results.append((f"格式 {fmt} 落盘 ({size[0]}x{size[1]}, 抓屏 {ms:.0f}ms)", ok, os.path.basename(path)))
     cfg["format"] = "png"
+
+    cfg["prefix"] = r"..\..\evil_"
+    escaped = capturer.save()[0]
+    leftovers = [e for e in os.listdir(cfg["save_dir"]) if e.endswith(".part")]
+    cfg["prefix"] = "selftest_"
+    inside = os.path.dirname(os.path.abspath(escaped)) == os.path.abspath(cfg["save_dir"])
+    results.append(("前缀不能把文件写出保存目录", inside and not leftovers, os.path.basename(escaped)))
+
+    name_checks = [
+        (safe_file_prefix("") == "shot_", "空前缀回退 shot_"),
+        (safe_file_prefix("a<b>:c") == "abc", "非法字符剔除"),
+        (safe_file_prefix("../../x") == "x", "路径穿越剔除"),
+    ]
+    bad_name = [name for ok, name in name_checks if not ok]
+    results.append(("文件名前缀清洗规则", not bad_name, bad_name or "ok"))
 
     cfg["copy_to_clipboard"] = True
     try:
