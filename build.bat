@@ -3,28 +3,44 @@ setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
 
-echo [1/3] 安装依赖...
+rem Keep this file ASCII-only: cmd reads .bat in chunks and can cut a multi-byte
+rem character in half, which corrupts the line that follows it.
+rem A running exe locks dist\PortableScreenshot.exe, so PyInstaller cannot replace it.
+tasklist /FI "IMAGENAME eq PortableScreenshot.exe" /NH | findstr /c:"PortableScreenshot.exe" >nul
+if not errorlevel 1 goto :running
+
+echo [1/3] Installing dependencies...
 python -m pip install --quiet mss pystray pillow pyinstaller
 
-echo [2/3] 自测（会真的按热键截图，请让桌面保持可见）...
+echo [2/3] Selftest - it really grabs the screen, keep the desktop visible...
 if not exist build mkdir build
-python -X utf8 src\screenshot_tool.py --selftest > build\selftest.log 2>&1 || goto :fail
+python -X utf8 src\screenshot_tool.py --selftest > build\selftest.log 2>&1
+if errorlevel 1 goto :fail
 type build\selftest.log
 
-echo [3/3] 打包单文件 exe...
+echo [3/3] Packaging single-file exe...
+rem Never append "|| goto" to a ^-continued command: cmd loses its place in the file.
 python -X utf8 -m PyInstaller --noconfirm --onefile --windowed --name PortableScreenshot ^
   --icon "%~dp0assets\app.ico" --hidden-import pystray._win32 ^
-  --distpath dist --workpath build\work --specpath build || goto :fail
+  --distpath dist --workpath build\work --specpath build src\screenshot_tool.py
+if errorlevel 1 goto :fail
 
 echo.
-echo 完成：dist\PortableScreenshot.exe（双击运行即可，同目录生成 config.json 与 Screenshots\）
-echo 自测结果已保存在 build\selftest.log
+echo Done: dist\PortableScreenshot.exe
+echo config.json and Screenshots\ are created beside the exe on first run.
 pause
 exit /b 0
 
+:running
+echo.
+echo PortableScreenshot.exe is still running.
+echo Right-click the tray icon, choose Exit, then double-click this script again.
+pause
+exit /b 1
+
 :fail
 echo.
-echo 构建已中止，请查看上方的报错输出。
-echo 自测的完整结果保存在 build\selftest.log，可以直接打开看。
+echo Build aborted - read the error above.
+echo Full selftest output is saved in build\selftest.log
 pause
 exit /b 1

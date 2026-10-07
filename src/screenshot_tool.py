@@ -993,13 +993,15 @@ def run_selftest():
         time.sleep(0.6)
         return len(fires) - before
 
-    F13, F14, F15 = 0x7C, 0x7D, 0x7E
+    F12, F13, F14, F15 = 0x7B, 0x7C, 0x7D, 0x7E
 
-    bound = bind([VK_SNAPSHOT])
-    fired = count_fires(lambda: press(VK_SNAPSHOT))
+    # 自测注入的按键只用 F 键：SendInput 发的 PrtSc 会被系统截图体验拦下，
+    # 弹 Snipping Tool 遮罩盖住桌面，看起来像程序出了问题。
+    bound = bind([F13])
+    fired = count_fires(lambda: press(F13))
     capturer.wait_idle()
     landed = fired == 1 and os.path.isfile(fires[-1][0])
-    results.append(("单键绑定并触发（PrtSc）", bound and landed,
+    results.append(("单键绑定并触发（F13）", bound and landed,
                     status_log[-1] if status_log else ""))
 
     # 顺序敏感：绑定 F13→F14 时，先按 F14 再按 F13 不该触发
@@ -1015,11 +1017,11 @@ def run_selftest():
 
     # 绑定弹窗里没按键就按 Esc = 取消绑定，此时任何键都不该截图
     bound = bind([])
-    idle = count_fires(lambda: (press(VK_SNAPSHOT), press(F13), press(F14)))
+    idle = count_fires(lambda: (press(F12), press(F13), press(F14)))
     results.append(("取消绑定后不存在截图键", bound and idle == 0 and hotkey_label([]) == "未绑定", idle))
 
     bound = bind([F15])
-    old = count_fires(lambda: (press(VK_SNAPSHOT), press(F13), time.sleep(0.05), press(F14)))
+    old = count_fires(lambda: (press(F12), press(F13), time.sleep(0.05), press(F14)))
     new = count_fires(lambda: press(F15))
     capturer.wait_idle()
     results.append(("换绑后旧键失效、新键生效", bound and old == 0 and new == 1, (old, new)))
