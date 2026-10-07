@@ -1,0 +1,17 @@
+# 构建产物
+build/
+build2/
+dist/
+*.spec
+
+# 运行时产生的本地文件
+config.json
+Screenshots/
+selftest_out/
+_gui_check.png
+_dbg.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
