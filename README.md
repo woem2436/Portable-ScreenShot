@@ -2,7 +2,7 @@
 
 ## 用法
 
-1. 运行 `PortableScreenshot.exe`。首次运行会在 exe 同目录生成 `config.json` 和 `Screenshots\`。
+1. 运行 `PortableScreenshot_v1.0.exe`。首次运行会在 exe 同目录生成 `config.json` 和 `Screenshots\`。
 2. 设置窗口 → **快捷键** → 截图键 → 点 **绑定…**
    - 弹窗里依次按下要绑的键，**按 Esc 确认**（立刻生效并写入配置，不需要再点保存）
    - 一个键都没按就按 Esc = **取消绑定**，此后没有任何键能触发截图
