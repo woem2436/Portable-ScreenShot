@@ -8,7 +8,7 @@ dist/
 config.json
 Screenshots/
 selftest_out/
-_gui_check.png
+_gui_*.png
 _dbg.log
 
 # Python

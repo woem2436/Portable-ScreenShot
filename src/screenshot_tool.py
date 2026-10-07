@@ -1,7 +1,8 @@
-"""Portable ScreenShot - 全局热键秒截屏 + 轻量配置界面。
+"""Portable ScreenShot - 按键序列截图 + 轻量配置界面。
 
-线程模型：主线程 Tkinter 设置窗口；hotkey 线程跑 Win32 消息循环 + RegisterHotKey；
-托盘线程由 pystray 管理。config.json 与 exe 同目录，保持便携。
+线程模型：主线程 Tkinter 设置窗口；hook 线程装 WH_KEYBOARD_LL 低级键盘钩子并按“按下顺序”
+匹配绑定的键序列（抓屏交给 drain 线程，钩子回调必须立刻返回）；托盘线程由 pystray 管理。
+config.json 与 exe 同目录，保持便携。
 """
 
 import ctypes
@@ -18,39 +19,64 @@ from ctypes import wintypes
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
-MOD_ALT = 0x0001
-MOD_CONTROL = 0x0002
-MOD_SHIFT = 0x0004
-MOD_WIN = 0x0008
-MOD_NOREPEAT = 0x4000
+VK_SNAPSHOT = 0x2C
+VK_ESCAPE = 0x1B
+GUI_SCALE = 2.0
 
-WM_HOTKEY = 0x0312
+# 绑定是“按下顺序”而非“同时按住”，所以最多记 SEQ_MAX 个键，
+# 相邻两键间隔超过 SEQ_TIMEOUT 秒就重新计数，避免隔了很久的两次按键凑成一次触发。
+SEQ_MAX = 4
+SEQ_TIMEOUT = 1.0
+
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
 WM_QUIT = 0x0012
 WM_APP = 0x8000
-PM_REMOVE = 1
 QS_ALLINPUT = 0x04FF
+LLKHF_UP = 0x80
+PM_REMOVE = 1
 CF_DIB = 8
 GMEM_MOVEABLE = 0x0002
 ERROR_ALREADY_EXISTS = 183
 SW_RESTORE = 9
 
-HOTKEY_ID = 0xE101
-VK_SNAPSHOT = 0x2C
-GUI_SCALE = 2.0
-
-# 允许无修饰键直接截图的按键，避免误绑普通字母键
-SINGLE_KEY_VKS = {VK_SNAPSHOT} | {0x70 + i for i in range(12)}
-MODIFIER_ONLY_VKS = {0x10, 0x11, 0x12, 0x13, 0x5B, 0x5C, 0x0A, 0x14}
-
 VKEY_NAMES = {
-    VK_SNAPSHOT: "PrtSc", 0x1B: "Esc", 0x0D: "Enter", 0x09: "Tab", 0x20: "空格",
-    0x2D: "Insert", 0x2E: "Delete", 0x21: "PageUp", 0x22: "PageDown",
+    VK_SNAPSHOT: "PrtSc", VK_ESCAPE: "Esc", 0x0D: "Enter", 0x09: "Tab", 0x20: "空格",
+    0x08: "Backspace", 0x2D: "Insert", 0x2E: "Delete", 0x21: "PageUp", 0x22: "PageDown",
     0x24: "Home", 0x23: "End", 0x25: "←", 0x26: "↑", 0x27: "→", 0x28: "↓",
+    0x10: "Shift", 0x11: "Ctrl", 0x12: "Alt", 0x13: "Pause", 0x14: "CapsLock",
+    0x5B: "LWin", 0x5C: "RWin", 0xBA: ";", 0xBF: "/", 0xC0: "`", 0xDE: "'",
+    0xBD: "-", 0xBB: "=", 0xDC: "\\", 0xDB: "[", 0x5D: "Apps",
 }
-for _i in range(12):
+for _i in range(15):
     VKEY_NAMES[0x70 + _i] = f"F{_i + 1}"
 for _i in range(10):
     VKEY_NAMES[0x30 + _i] = str(_i)
+    VKEY_NAMES[0x60 + _i] = f"Num{_i}"
+for _i in range(26):
+    VKEY_NAMES[0x41 + _i] = chr(0x41 + _i)
+
+
+def key_name(vk):
+    return VKEY_NAMES.get(int(vk), f"0x{int(vk):02X}")
+
+
+def hotkey_label(seq):
+    if not seq:
+        return "未绑定"
+    return " → ".join(key_name(vk) for vk in seq)
+
+
+def normalize_seq(value):
+    if value is None:
+        return []
+    out = []
+    for vk in value:
+        vk = int(vk)
+        if vk not in out:
+            out.append(vk)
+    return out[:SEQ_MAX]
 
 
 def is_frozen():
@@ -66,8 +92,7 @@ def app_dir():
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
 
 DEFAULT_CONFIG = {
-    "hotkey_vk": VK_SNAPSHOT,
-    "hotkey_mods": 0,
+    "hotkey_seq": [VK_SNAPSHOT],
     "format": "png",
     "quality": 92,
     "save_dir": os.path.join(app_dir(), "Screenshots"),
@@ -82,6 +107,13 @@ DEFAULT_CONFIG = {
 MONITOR_PRIMARY = "primary"
 MONITOR_ALL = "all"
 
+QUALITY_TIERS = (
+    (50, 64, "压缩较强，体积最小，文字与色带边缘会有块状伪影"),
+    (65, 79, "均衡，观感尚可，体积适中"),
+    (80, 92, "高质量，细节保留好，体积明显增大"),
+    (93, 100, "接近无损，体积最大，与 PNG 相比仍有轻微损失"),
+)
+
 
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
@@ -93,8 +125,7 @@ def load_config():
                 cfg[key] = stored[key]
     except (OSError, ValueError):
         pass
-    if int(cfg.get("hotkey_mods", 0)) & MOD_NOREPEAT:
-        cfg["hotkey_mods"] = int(cfg["hotkey_mods"]) & ~MOD_NOREPEAT
+    cfg["hotkey_seq"] = normalize_seq(cfg.get("hotkey_seq"))
     return cfg
 
 
@@ -105,47 +136,6 @@ def save_config(cfg):
         return True, CONFIG_PATH
     except OSError as exc:
         return False, str(exc)
-
-
-def is_key_down(vk):
-    return bool(user32.GetKeyState(vk) & 0x8000)
-
-
-def current_modifiers():
-    # 不用 Tk 的 event.state：Windows 上它是 MK_* 位，Alt/Win 读不准
-    mods = 0
-    if is_key_down(0x10):
-        mods |= MOD_SHIFT
-    if is_key_down(0x11):
-        mods |= MOD_CONTROL
-    if is_key_down(0x12):
-        mods |= MOD_ALT
-    if is_key_down(0x5B) or is_key_down(0x5C):
-        mods |= MOD_WIN
-    return mods
-
-
-def validate_binding(vk, mods):
-    if mods == 0 and vk not in SINGLE_KEY_VKS:
-        return False, "单键截图只推荐 PrtSc 或 F1-F12，其余键请搭配 Ctrl / Alt / Shift。"
-    return True, ""
-
-
-def hotkey_label(vk, mods):
-    parts = []
-    if mods & MOD_CONTROL:
-        parts.append("Ctrl")
-    if mods & MOD_ALT:
-        parts.append("Alt")
-    if mods & MOD_SHIFT:
-        parts.append("Shift")
-    if mods & MOD_WIN:
-        parts.append("Win")
-    name = VKEY_NAMES.get(vk)
-    if name is None:
-        name = chr(vk) if 32 <= vk < 0x100 else f"0x{vk:02X}"
-    parts.append(name)
-    return " + ".join(parts)
 
 
 KEYEVENTF_KEYUP = 0x0002
@@ -403,62 +393,123 @@ class _Job:
         self.cfg = cfg
 
 
-class HotkeyManager:
-    """热键的注册/换绑/触发都在这一个线程的消息循环里完成。"""
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+
+class KeySequenceHook:
+    """WH_KEYBOARD_LL 上按“按下顺序”匹配绑定序列，所以 Z→Ctrl 与 Ctrl→Z 是两回事。
+
+    钩子回调必须极快返回，否则整台机器的输入都会卡住，因此这里只往队列丢一个信号，
+    真正的抓屏由 _drain 线程做。
+    """
 
     def __init__(self, on_capture, on_status):
         self.on_capture = on_capture
         self.on_status = on_status
-        self.thread = threading.Thread(target=self._loop, daemon=True, name="hotkey-loop")
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="keyboard-hook")
+        self._worker = threading.Thread(target=self._drain, daemon=True, name="trigger")
+        self._signals = queue.Queue(maxsize=1)
         self._pending = None
         self._stop = False
         self._tid = None
-        self._registered = None
+        self._seq = []
+        self._index = 0
+        self._last_step = 0.0
+        self._paused = False
+        self._proc = HOOKPROC(self._callback)  # 必须长期持有引用，被 GC 后钩子会崩
+
+    def set_paused(self, value):
+        """绑定弹窗打开期间暂停触发，免得边按键边截图。"""
+        self._paused = bool(value)
 
     def start(self):
         self.thread.start()
+        self._worker.start()
 
-    def configure(self, vk, mods):
-        self._pending = (int(vk), int(mods) | MOD_NOREPEAT)
+    def configure(self, seq):
+        self._pending = normalize_seq(seq)
         if self._tid:
             user32.PostThreadMessageW(self._tid, WM_APP, 0, 0)
+
+    @property
+    def binding(self):
+        return list(self._seq)
 
     def is_alive(self):
         return self.thread.is_alive()
 
+    def _drain(self):
+        while True:
+            self._signals.get()
+            self.on_capture()
+
+    def _feed(self, vk):
+        if not self._seq or self._paused:
+            return
+        now = time.monotonic()
+        if now - self._last_step > SEQ_TIMEOUT:
+            self._index = 0
+        self._last_step = now
+        if vk != self._seq[self._index]:
+            self._index = 1 if vk == self._seq[0] else 0
+            return
+        self._index += 1
+        if self._index >= len(self._seq):
+            self._index = 0
+            try:
+                self._signals.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def _callback(self, ncode, wparam, lparam):
+        if ncode == 0 and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+            info = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            if not info.flags & LLKHF_UP:
+                self._feed(int(info.vkCode))
+        return user32.CallNextHookEx(None, ncode, wparam, lparam)
+
     def _apply_pending(self):
         if self._pending is None:
             return
-        vk, mods = self._pending
-        self._pending = None
-        if self._registered:
-            user32.UnregisterHotKey(None, HOTKEY_ID)
-            self._registered = None
-        if user32.RegisterHotKey(None, HOTKEY_ID, mods, vk):
-            self._registered = (vk, mods)
-            self.on_status(f"全局热键 {hotkey_label(vk, mods & ~MOD_NOREPEAT)} 已注册", True)
-        else:
-            self.on_status(f"热键 {hotkey_label(vk, mods & ~MOD_NOREPEAT)} 注册失败（已被占用）", False)
+        self._seq, self._pending = self._pending, None
+        self._index = 0
+        self.on_status(f"截图键：{hotkey_label(self._seq)}", bool(self._seq))
 
     def _loop(self):
+        # ctypes 默认按 32 位 int 处理返回值与入参，64 位下 HMODULE/HHOOK 会被截断，
+        # SetWindowsHookExW 会报 ERROR_MOD_NOT_FOUND，所以原型必须先声明。
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, ctypes.c_void_p, wintypes.DWORD]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+        user32.CallNextHookEx.restype = ctypes.c_long
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        kernel32.GetModuleHandleW.restype = ctypes.c_void_p
         self._tid = kernel32.GetCurrentThreadId()
-        msg = wintypes.MSG()
-        # 先摸一次消息队列，确保 RegisterHotKey 有队列可用
-        while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
-            pass
         self._apply_pending()
+        hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc, kernel32.GetModuleHandleW(None), 0)
+        if not hook:
+            err = kernel32.GetLastError()
+            self.on_status(f"键盘钩子安装失败（{ctypes.WinError(err)}），截图键不会生效", False)
+            return
+        msg = wintypes.MSG()
         while not self._stop:
             self._apply_pending()
-            user32.MsgWaitForMultipleObjects(0, None, False, 200, QS_ALLINPUT)
+            user32.MsgWaitForMultipleObjects(0, None, False, 250, QS_ALLINPUT)
             while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
                 if msg.message == WM_QUIT:
                     self._stop = True
                     break
-                if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
-                    self.on_capture()
-        if self._registered:
-            user32.UnregisterHotKey(None, HOTKEY_ID)
-            self._registered = None
+        user32.UnhookWindowsHookEx(hook)
 
     def stop(self):
         self._stop = True
@@ -496,13 +547,13 @@ def build_settings_window(cfg, manager):
     def px(value):
         return int(value * GUI_SCALE)
 
-    status_var = tk.StringVar(master=root, value="正在注册全局热键…")
+    status_var = tk.StringVar(master=root, value="正在安装键盘钩子…")
     root.title("Portable ScreenShot 设置")
     root.resizable(False, False)
     root.attributes("-topmost", True)
     root.after(400, lambda: root.attributes("-topmost", False))
 
-    pending = {"vk": int(cfg["hotkey_vk"]), "mods": int(cfg["hotkey_mods"])}
+    pending = {"seq": list(cfg["hotkey_seq"])}
     body = ttk.Frame(root, padding=px(12))
     body.grid(row=0, column=0, sticky="nsew")
 
@@ -512,28 +563,60 @@ def build_settings_window(cfg, manager):
         return row + 1
 
     r = section(0, "快捷键")
-    hotkey_var = tk.StringVar(value=hotkey_label(pending["vk"], pending["mods"]))
-    ttk.Label(body, text="截图热键").grid(row=r, column=0, sticky="w")
-    entry = ttk.Entry(body, textvariable=hotkey_var, width=24)
-    entry.grid(row=r, column=1, sticky="w", pady=px(2))
+    hotkey_var = tk.StringVar(master=root, value=hotkey_label(pending["seq"]))
+    ttk.Label(body, text="截图键").grid(row=r, column=0, sticky="w")
+    row_key = ttk.Frame(body)
+    row_key.grid(row=r, column=1, sticky="w", pady=px(2))
+    ttk.Entry(row_key, textvariable=hotkey_var, width=14, state="readonly").pack(side="left")
+    ttk.Button(row_key, text="绑定…", width=8, command=lambda: open_binding_dialog()).pack(
+        side="left", padx=(px(6), 0))
     r += 1
 
-    def capture_key(event):
-        vk = int(event.keycode)
-        if vk in MODIFIER_ONLY_VKS:
-            return "break"
-        mods = current_modifiers()
-        ok, reason = validate_binding(vk, mods)
-        if not ok:
-            messagebox.showwarning("容易被误按", reason)
-            return "break"
-        pending["vk"], pending["mods"] = vk, mods
-        hotkey_var.set(hotkey_label(vk, mods))
-        return "break"
+    def open_binding_dialog():
+        dlg = tk.Toplevel(root)
+        dlg.title("绑定截图键")
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+        dlg.grab_set()
+        pressed = []
+        live_var = tk.StringVar(master=dlg, value="…")
+        pad = px(18)
+        ttk.Label(dlg, text="请依次按下要绑定的按键", font=("Segoe UI", 11)).pack(
+            pady=(pad, px(6)), padx=pad)
+        ttk.Label(dlg, textvariable=live_var, font=("Segoe UI", 16, "bold"),
+                  foreground="#1f8a4c").pack(pady=(0, px(10)), padx=pad)
+        ttk.Label(dlg, text="按 Esc 确认；没按任何键时 Esc = 取消绑定",
+                  foreground="#666").pack(pady=(0, pad + px(8)), padx=pad)
 
-    entry.bind("<Button-1>", lambda _e: entry.focus_set())
-    entry.bind("<KeyPress>", capture_key)
-    entry.bind("<Escape>", lambda _e: "break")
+        def close(commit):
+            if commit:
+                pending["seq"] = normalize_seq(pressed)
+                hotkey_var.set(hotkey_label(pending["seq"]))
+            if manager:
+                manager.set_paused(False)
+            dlg.destroy()
+
+        def on_key(event):
+            vk = int(event.keycode)
+            if vk == VK_ESCAPE:
+                close(bool(pressed))  # 没按键时 Esc = 取消绑定；有键则确认
+                return "break"
+            if len(pressed) < SEQ_MAX and vk not in pressed:
+                pressed.append(vk)
+                live_var.set(hotkey_label(pressed))
+            return "break"
+
+        if manager:
+            manager.set_paused(True)
+        dlg.bind("<KeyPress>", on_key)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: close(False))  # 点 ✕ = 保持原绑定
+        dlg.transient(root)  # 跟着主窗走，别留在桌面角落
+        dlg.update_idletasks()
+        cx = root.winfo_rootx() + (root.winfo_width() - dlg.winfo_reqwidth()) // 2
+        cy = root.winfo_rooty() + (root.winfo_height() - dlg.winfo_reqheight()) // 2
+        dlg.geometry(f"+{max(0, cx)}+{max(0, cy)}")
+        dlg.focus_set()
+        dlg.bind("<Button-1>", lambda _e: dlg.focus_set())
 
     r = section(r, "输出")
     ttk.Label(body, text="图片格式").grid(row=r, column=0, sticky="w")
@@ -544,8 +627,26 @@ def build_settings_window(cfg, manager):
 
     ttk.Label(body, text="JPG 质量").grid(row=r, column=0, sticky="w")
     quality = tk.IntVar(value=int(cfg["quality"]))
-    ttk.Scale(body, from_=50, to=100, variable=quality, length=px(160)).grid(row=r, column=1, sticky="w")
+    quality_desc = tk.StringVar(master=root)
+    slider = ttk.Scale(body, from_=50, to=100, variable=quality, command=lambda _v: refresh_quality(),
+                       length=px(160))
+    slider.grid(row=r, column=1, sticky="w")
     r += 1
+    ttk.Label(body, textvariable=quality_desc, foreground="#555").grid(row=r, column=1, sticky="w")
+    r += 1
+
+    def refresh_quality():
+        q = int(quality.get())
+        tier = next(text for lo, hi, text in QUALITY_TIERS if lo <= q <= hi)
+        if fmt_box.get() == "jpg":
+            slider.state(["!disabled"])
+            quality_desc.set(f"{q} · {tier}")
+        else:
+            slider.state(["disabled"])
+            quality_desc.set(f"{q} · 当前格式为 {fmt_box.get()}，此项暂不生效")
+
+    fmt_box.bind("<<ComboboxSelected>>", lambda _e: refresh_quality())
+    refresh_quality()
 
     ttk.Label(body, text="命名方式").grid(row=r, column=0, sticky="w")
     naming = ttk.Combobox(body, values=["timestamp", "sequence"], state="readonly", width=11)
@@ -607,8 +708,7 @@ def build_settings_window(cfg, manager):
 
     def apply_and_save():
         new = dict(cfg)
-        new["hotkey_vk"] = pending["vk"]
-        new["hotkey_mods"] = pending["mods"]
+        new["hotkey_seq"] = list(pending["seq"])
         new["format"] = fmt_box.get()
         new["quality"] = int(quality.get())
         new["naming"] = naming.get()
@@ -620,7 +720,7 @@ def build_settings_window(cfg, manager):
         cfg.clear()
         cfg.update(new)
         ok, info = save_config(cfg)
-        manager.configure(new["hotkey_vk"], new["hotkey_mods"])
+        manager.configure(new["hotkey_seq"])
         status_var.set(f"配置已保存（{info}）")
         if not ok:
             messagebox.showerror("写入失败", info)
@@ -634,7 +734,7 @@ def build_settings_window(cfg, manager):
     actions = ttk.Frame(body)
     actions.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(px(16), 0))
     ttk.Button(actions, text="保存设置", command=apply_and_save).pack(side="left")
-    ttk.Button(actions, text="隐藏到后台（热键继续有效）",
+    ttk.Button(actions, text="隐藏到后台",
                command=hide_to_background).pack(side="left", padx=px(6))
 
     bar = ttk.Frame(root)
@@ -702,8 +802,8 @@ def run(cfg, headless=False, tray=True):
             capturer.last_error = str(exc)
             report(f"截图失败：{exc}")
 
-    manager = HotkeyManager(do_capture, lambda text, ok: report(text))
-    manager.configure(cfg["hotkey_vk"], cfg["hotkey_mods"])
+    manager = KeySequenceHook(do_capture, lambda text, ok: report(text))
+    manager.configure(cfg["hotkey_seq"])
     manager.start()
 
     if headless:
@@ -731,7 +831,7 @@ def run(cfg, headless=False, tray=True):
             )
             icon = pystray.Icon(
                 "portable_screenshot", build_icon_image(),
-                f"Portable ScreenShot · {hotkey_label(cfg['hotkey_vk'], cfg['hotkey_mods'])}", menu)
+                f"Portable ScreenShot · 截图键 {hotkey_label(cfg['hotkey_seq'])}", menu)
             threading.Thread(target=icon.run, daemon=True, name="tray").start()
         except Exception:
             icon = None
@@ -783,11 +883,11 @@ def run_selftest():
         fires.append(capturer.capture_now())
 
     status_log = []
-    manager = HotkeyManager(on_capture, lambda text, ok: status_log.append(text))
+    manager = KeySequenceHook(on_capture, lambda text, ok: status_log.append(text))
     manager.start()
 
     def key_event(vk, up=False):
-        # 注入按键统一用 SendInput：keybd_event 在部分机器上不产生热键事件
+        # 注入按键统一用 SendInput：低级键盘钩子能看到注入键，所以序列匹配可以全自动验证
         inp = INPUT()
         inp.type = INPUT_KEYBOARD
         inp.ii.ki.wVk = int(vk)
@@ -799,46 +899,55 @@ def run_selftest():
         time.sleep(0.03)
         key_event(vk, up=True)
 
-    MOD_VKS = [(MOD_CONTROL, 0x11), (MOD_SHIFT, 0x10), (MOD_ALT, 0x12)]
+    def bind(seq):
+        manager.configure(seq)
+        return wait_until(lambda: manager.binding == list(seq))
 
-    def press_combo(mods, vk):
-        for flag, mod_vk in MOD_VKS:
-            if mods & flag:
-                key_event(mod_vk)
-        press(vk)
-        for flag, mod_vk in reversed(MOD_VKS):
-            if mods & flag:
-                key_event(mod_vk, up=True)
-        time.sleep(0.25)
+    def count_fires(action):
+        before = len(fires)
+        action()
+        time.sleep(0.6)
+        return len(fires) - before
 
-    test_vk, test_mods = 0x78, MOD_CONTROL | MOD_SHIFT  # Ctrl+Shift+F9
-    manager.configure(test_vk, test_mods)
-    bound = wait_until(lambda: manager._registered == (test_vk, test_mods | MOD_NOREPEAT))
-    time.sleep(0.3)
-    press_combo(test_mods, test_vk)
-    press_combo(test_mods, test_vk)
-    fired = wait_until(lambda: len(fires) >= 2)
+    F13, F14, F15 = 0x7C, 0x7D, 0x7E
+
+    bound = bind([VK_SNAPSHOT])
+    fired = count_fires(lambda: press(VK_SNAPSHOT))
     capturer.wait_idle()
-    landed = all(os.path.isfile(path) for path, _s, _m in fires)
-    results.append(("热键触发截图（Ctrl+Shift+F9）", bound and fired and landed, len(fires)))
+    landed = fired == 1 and os.path.isfile(fires[-1][0])
+    results.append(("单键绑定并触发（PrtSc）", bound and landed,
+                    status_log[-1] if status_log else ""))
 
-    # 换绑：旧键应失效，新键应生效
-    second_vk, second_mods = 0x79, MOD_CONTROL | MOD_SHIFT  # Ctrl+Shift+F10
-    manager.configure(second_vk, second_mods)
-    rebound = wait_until(lambda: manager._registered == (second_vk, second_mods | MOD_NOREPEAT))
-    press_combo(test_mods, test_vk)
-    time.sleep(0.5)
-    after_old = len(fires)
-    press_combo(second_mods, second_vk)
-    after_new = wait_until(lambda: len(fires) > after_old)
-    results.append(("换绑后旧热键失效、新热键生效", rebound and after_old == len(fires) - 1 and after_new, (after_old, len(fires))))
+    # 顺序敏感：绑定 F13→F14 时，先按 F14 再按 F13 不该触发
+    bound = bind([F13, F14])
+    wrong = count_fires(lambda: (press(F14), time.sleep(0.05), press(F13)))
+    right = count_fires(lambda: (press(F13), time.sleep(0.05), press(F14)))
+    capturer.wait_idle()
+    results.append(("组合键顺序敏感（反序不触发、正序触发）", bound and wrong == 0 and right == 1, (wrong, right)))
 
-    # PrintScreen 只能验证注册成功：Windows 会过滤注入的 PrtSc，模拟按键不会触发热键
-    manager.configure(VK_SNAPSHOT, 0)
-    prtscc_bound = wait_until(lambda: manager._registered == (VK_SNAPSHOT, MOD_NOREPEAT))
-    results.append(("PrtSc 单键注册（需物理按键确认触发）", prtscc_bound, status_log[-1] if status_log else ""))
-    manager.configure(test_vk, test_mods)
-    wait_until(lambda: manager._registered == (test_vk, test_mods | MOD_NOREPEAT))
+    # 两键间隔超过 SEQ_TIMEOUT 就不算同一次组合
+    stale = count_fires(lambda: (press(F13), time.sleep(SEQ_TIMEOUT + 0.4), press(F14)))
+    results.append((f"间隔超过 {SEQ_TIMEOUT}s 的两键不触发", stale == 0, stale))
+
+    # 绑定弹窗里没按键就按 Esc = 取消绑定，此时任何键都不该截图
+    bound = bind([])
+    idle = count_fires(lambda: (press(VK_SNAPSHOT), press(F13), press(F14)))
+    results.append(("取消绑定后不存在截图键", bound and idle == 0 and hotkey_label([]) == "未绑定", idle))
+
+    bound = bind([F15])
+    old = count_fires(lambda: (press(VK_SNAPSHOT), press(F13), time.sleep(0.05), press(F14)))
+    new = count_fires(lambda: press(F15))
+    capturer.wait_idle()
+    results.append(("换绑后旧键失效、新键生效", bound and old == 0 and new == 1, (old, new)))
+
+    seq_checks = [
+        (normalize_seq(None) == [], "None 视为未绑定"),
+        (normalize_seq([0x42, 0x42, 0x43]) == [0x42, 0x43], "重复键去重"),
+        (len(normalize_seq([0x41, 0x42, 0x43, 0x44, 0x45])) == SEQ_MAX, "超过 SEQ_MAX 截断"),
+        (hotkey_label([0x41, 0x11]) == "A → Ctrl", "标签按顺序展示"),
+    ]
+    bad = [name for ok, name in seq_checks if not ok]
+    results.append(("按键序列规范化规则", not bad, bad or "ok"))
 
     for fmt in ("png", "jpg", "bmp"):
         cfg["format"] = fmt
@@ -862,23 +971,6 @@ def run_selftest():
     drained = capturer.wait_idle(15)
     count = len([e for e in os.listdir(cfg["save_dir"]) if e.startswith("selftest_")])
     results.append((f"连打 5 张延迟 {max(burst):.0f}ms", drained and count >= 5, [f"{t:.0f}" for t in burst]))
-
-    user32.keybd_event(0x11, 0, 0, 0)  # Ctrl down
-    user32.keybd_event(0x10, 0, 0, 0)  # Shift down
-    time.sleep(0.15)
-    held = current_modifiers()
-    user32.keybd_event(0x10, 0, 2, 0)
-    user32.keybd_event(0x11, 0, 2, 0)
-    results.append(("按住 Ctrl+Shift 时修饰键识别", held == (MOD_CONTROL | MOD_SHIFT), hex(held)))
-
-    checks = [
-        (validate_binding(VK_SNAPSHOT, 0)[0], True, "PrtSc 单键"),
-        (validate_binding(0x76, 0)[0], True, "F7 单键"),
-        (validate_binding(0x42, 0)[0], False, "B 单键被拒"),
-        (validate_binding(0x42, MOD_CONTROL)[0], True, "Ctrl+B"),
-    ]
-    bad = [name for allowed, expected, name in checks if bool(allowed) != expected]
-    results.append(("热键绑定校验规则", not bad, bad or "ok"))
 
     cfg["naming"] = "sequence"
     cfg["prefix"] = "seq_"
